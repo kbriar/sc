@@ -1,0 +1,93 @@
+#!pip install pulp   # Install PuLP if needed
+import pulp
+import math
+
+# --------------------------------------------------------------------------------
+# 1) Inputs: 48 half-hours in a day (00:00..23:30) and the "required" headcount
+# --------------------------------------------------------------------------------
+required = [
+    24,19,16,16,18,15,12, 8,10,11, 7, 4,   # 00:00..05:30
+    18,14, 7, 8, 9, 9,13,11, 9,11,13,14,   # 06:00..11:30
+    16,15,16,16,23,23,20,14,17,17,18,20,   # 12:00..17:30
+    24,23,22,21,16,19,16,16,21,21,21,19    # 18:00..23:30
+]
+assert len(required) == 48
+
+# --------------------------------------------------------------------------------
+# 2) Define shifts with start/end times (mod 24).  We assume:
+#    - Shift 1: 06:00..15:00
+#    - Shift 2: 10:00..19:00
+#    - Shift 3: 14:00..23:00
+#    - Shift 4: 20:00..05:00 next day
+#    - Shift 5: 23:00..08:00 next day
+# --------------------------------------------------------------------------------
+shifts = {
+    1: (6, 15),
+    2: (10,19),
+    3: (14,23),
+    4: (20, 5),  # wrap past midnight
+    5: (23, 8)   # wrap past midnight
+}
+
+def in_interval_mod24(x, start, end):
+    """True if x mod 24 is in [start, end) mod 24, handling midnight wrap."""
+    x_mod = x % 24
+    s_mod = start % 24
+    e_mod = end % 24
+    if s_mod < e_mod:
+        return s_mod <= x_mod < e_mod
+    else:
+        return (x_mod >= s_mod) or (x_mod < e_mod)
+
+def shift_covers(t, shift_id):
+    """True if shift_id covers half-hour t's midpoint."""
+    shift_start, shift_end = shifts[shift_id]
+    # midpoint of slot t in hours (0..24)
+    midpoint = t*0.5 + 0.25
+    return in_interval_mod24(midpoint, shift_start, shift_end)
+
+# Precompute which shifts cover each half-hour t
+cover_list = []
+for t in range(48):
+    covering_shifts = []
+    for s_id in shifts:
+        if shift_covers(t, s_id):
+            covering_shifts.append(s_id)
+    cover_list.append(covering_shifts)
+
+# --------------------------------------------------------------------------------
+# 3) Build the model: x_1..x_5 are integer staff levels for the entire shift
+# --------------------------------------------------------------------------------
+model = pulp.LpProblem("MinShiftStaff", pulp.LpMinimize)
+
+# Decision variables: how many staff on each shift (integer)
+x = {}
+for s_id in shifts:
+    x[s_id] = pulp.LpVariable(f"x_shift{s_id}", lowBound=0, cat=pulp.LpInteger)
+
+# Objective: minimize sum of x_i
+model += pulp.lpSum(x[s_id] for s_id in shifts), "TotalStaff"
+
+# Constraints: for each half-hour t, sum of x_i over covering shifts >= required[t]
+for t in range(48):
+    model += pulp.lpSum(x[s_id] for s_id in cover_list[t]) >= required[t], f"Coverage_t{t}"
+
+# Solve
+model.solve(pulp.PULP_CBC_CMD(msg=0))
+
+# Print results
+print("Status:", pulp.LpStatus[model.status])
+if pulp.LpStatus[model.status] == "Optimal":
+    # Optimal staff for each shift
+    for s_id in sorted(x.keys()):
+        print(f"Shift {s_id}: {pulp.value(x[s_id])} staff")
+
+    print("\nTotal staff =", sum(pulp.value(x[s_id]) for s_id in x))
+
+    # Check coverage in each time slot
+    print("\nCoverage by half-hour slot:")
+    for t in range(48):
+        coverage_t = sum(pulp.value(x[s_id]) for s_id in cover_list[t])
+        print(f"Slot {t:02d} (Req {required[t]}): Coverage={coverage_t}")
+else:
+    print("No feasible solution found or problem unbounded.")
