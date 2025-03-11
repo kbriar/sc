@@ -1,0 +1,156 @@
+#!pip install pulp matplotlib pandas
+import pulp
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ------------------------------------------------------------------------------
+# 1) Define time slots and required headcounts
+#    We assume half-hours t=0..47 => 00:00..23:30
+# ------------------------------------------------------------------------------
+time_labels = []
+for t in range(48):
+    hh = t // 2
+    mm = (t % 2)*30
+    time_labels.append(f"{hh:02d}:{mm:02d}")
+
+required = [
+    24,19,16,16,18,15,12, 8,10,11, 7, 4,   # 00:00..05:30
+    18,14, 7, 8, 9, 9,13,11, 9,11,13,14,   # 06:00..11:30
+    16,15,16,16,23,23,20,14,17,17,18,20,   # 12:00..17:30
+    24,23,22,21,16,19,16,16,21,21,21,19    # 18:00..23:30
+]
+assert len(required) == 48
+
+# ------------------------------------------------------------------------------
+# 2) Shifts with fixed start/end times (mod 24)
+#    SHIFT 1 = 06:00..15:00
+#    SHIFT 2 = 10:00..19:00
+#    SHIFT 3 = 14:00..23:00
+#    SHIFT 4 = 20:00..05:00 next day
+#    SHIFT 5 = 23:00..08:00 next day
+# ------------------------------------------------------------------------------
+shifts = {
+    1: (6, 15),
+    2: (10,19),
+    3: (14,23),
+    4: (20, 5),
+    5: (23, 8)
+}
+
+def in_interval_mod24(x, start, end):
+    """True if x mod 24 is in [start, end) mod 24 (handling midnight wrap)."""
+    x_mod = x % 24
+    s_mod = start % 24
+    e_mod = end % 24
+    if s_mod < e_mod:
+        return s_mod <= x_mod < e_mod
+    else:
+        # Wraps midnight
+        return (x_mod >= s_mod) or (x_mod < e_mod)
+
+def shift_covers_slot(shift_start, shift_end, t):
+    """Check if shift covers the midpoint of half-hour t (0..47)."""
+    midpoint = t*0.5 + 0.25
+    return in_interval_mod24(midpoint, shift_start, shift_end)
+
+# Build list of which shifts cover each half-hour
+cover_list = []
+for t in range(48):
+    covering = []
+    for sid, (sstart, send) in shifts.items():
+        if shift_covers_slot(sstart, send, t):
+            covering.append(sid)
+    cover_list.append(covering)
+
+# ------------------------------------------------------------------------------
+# 3) Integer LP with one variable per shift
+#    x[s] = integer staff assigned to shift s for the entire day
+# ------------------------------------------------------------------------------
+model = pulp.LpProblem("MinimizeStaff", pulp.LpMinimize)
+
+# Decision variables: staff on each shift
+x = {s: pulp.LpVariable(f"x_shift{s}", lowBound=0, cat=pulp.LpInteger) 
+     for s in shifts}
+
+# Objective: minimize total staff across all shifts
+model += pulp.lpSum(x[s] for s in shifts), "TotalStaff"
+
+# Constraints: for each half-hour, sum of staff on overlapping shifts >= required[t]
+for t in range(48):
+    model += pulp.lpSum(x[s] for s in cover_list[t]) >= required[t], f"Cov_{t}"
+
+# Solve
+model.solve(pulp.PULP_CBC_CMD(msg=0))
+print("Solver status:", pulp.LpStatus[model.status])
+
+if pulp.LpStatus[model.status] == "Optimal":
+    # Optimal staff counts for each shift
+    sol = {s: int(pulp.value(x[s])) for s in shifts}
+
+    print("\nOptimal Staff on Each Shift:")
+    for s in sorted(sol.keys()):
+        print(f"  Shift {s}: {sol[s]}")
+
+    # --------------------------------------------------------------------------
+    # 4) Produce a table of coverage in each half-hour:
+    #    For time slot t, Shift i coverage = x[i] if shift i covers t, else 0
+    # --------------------------------------------------------------------------
+    table_rows = []
+    for t in range(48):
+        shift_vals = []
+        for s in sorted(shifts.keys()):
+            staff_count = sol[s] if (s in cover_list[t]) else 0
+            shift_vals.append(staff_count)
+
+        total_cov = sum(shift_vals)
+        row = {
+            "Time": time_labels[t],
+            "Shift1": shift_vals[0],
+            "Shift2": shift_vals[1],
+            "Shift3": shift_vals[2],
+            "Shift4": shift_vals[3],
+            "Shift5": shift_vals[4],
+            "Total Coverage": total_cov,
+            "Required": required[t]
+        }
+        table_rows.append(row)
+
+    df = pd.DataFrame(table_rows)
+    print("\nCoverage Table (each shift’s coverage is constant across its span):")
+    print(df.to_string(index=False))
+
+    # --------------------------------------------------------------------------
+    # 5) Plot a stacked bar chart of the coverage by shift, with a line for required
+    # --------------------------------------------------------------------------
+    times = np.arange(48)  # x-axis for time slots
+    shift_names = ["Shift1","Shift2","Shift3","Shift4","Shift5"]
+    # We'll stack each shift's coverage
+    bottom = np.zeros(48)
+    color_map = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd"]  # some distinct colors
+
+    plt.figure(figsize=(15,6))
+    for i, sh in enumerate(shift_names):
+        cover_i = df[sh].values
+        plt.bar(times, cover_i, bottom=bottom, 
+                color=color_map[i], edgecolor="white", 
+                label=sh)
+        bottom += cover_i  # stack on top
+
+    # Plot required as a red line
+    plt.plot(times, df["Required"].values, "r--", label="Required", linewidth=2)
+
+    # Labeling
+    plt.title("Coverage by Shift (Stacked) vs. Required")
+    plt.xlabel("Half-hour slot (0=00:00, 1=00:30, ...)")
+    plt.ylabel("Number of Staff")
+    plt.legend(loc="upper right")
+
+    # Optional: show fewer ticks on x-axis
+    plt.xticks(range(0,49,4), [time_labels[t] for t in range(0,49,4)], rotation=45)
+    plt.grid(axis="y", linestyle=":", alpha=0.6)
+    plt.tight_layout()
+    plt.show()
+
+else:
+    print("No feasible solution found or problem unbounded.")
