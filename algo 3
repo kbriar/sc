@@ -1,0 +1,110 @@
+#!pip install pulp  # Uncomment if needed
+import pulp
+import pandas as pd
+
+# ----- 1) Define your half-hour slots and the required coverage -----
+time_labels = []
+for t in range(48):
+    hour = t // 2
+    minute = (t % 2)*30
+    time_labels.append(f"{hour:02d}:{minute:02d}")
+
+required = [
+    24,19,16,16,18,15,12, 8,10,11, 7, 4,   # 00:00..05:30
+    18,14, 7, 8, 9, 9,13,11, 9,11,13,14,   # 06:00..11:30
+    16,15,16,16,23,23,20,14,17,17,18,20,   # 12:00..17:30
+    24,23,22,21,16,19,16,16,21,21,21,19    # 18:00..23:30
+]
+assert len(required) == 48
+
+# ----- 2) Define shifts and a function to see if a shift covers a slot -----
+shifts = {
+    1: (6, 15),   # Shift 1 = 06:00..15:00
+    2: (10, 19),  # Shift 2 = 10:00..19:00
+    3: (14, 23),  # Shift 3 = 14:00..23:00
+    4: (20, 5),   # Shift 4 = 20:00..05:00
+    5: (23, 8),   # Shift 5 = 23:00..08:00
+}
+
+def in_interval_mod24(x, start, end):
+    """Return True if x mod 24 is in [start, end) mod 24."""
+    x_mod = x % 24
+    s_mod = start % 24
+    e_mod = end % 24
+    if s_mod < e_mod:
+        return s_mod <= x_mod < e_mod
+    else:
+        # wraps midnight
+        return (x_mod >= s_mod) or (x_mod < e_mod)
+
+def shift_covers_slot(shift_start, shift_end, slot_index):
+    """Check if the shift covers the midpoint of slot_index."""
+    midpoint = slot_index*0.5 + 0.25  # e.g. 0.25 => 00:15, 1.25 => 00:45, ...
+    return in_interval_mod24(midpoint, shift_start, shift_end)
+
+# Build a cover matrix: which shifts cover each half-hour slot?
+cover_matrix = {}
+for t in range(48):
+    cover_matrix[t] = []
+    for sid, (sstart, send) in shifts.items():
+        if shift_covers_slot(sstart, send, t):
+            cover_matrix[t].append(sid)
+
+# k(t) = how many shifts cover slot t
+k = [len(cover_matrix[t]) for t in range(48)]
+
+# ----- 3) Formulate the model: coverage[t] is integer, coverage[t]*k(t) <= required[t], maximize sum of coverage -----
+prob = pulp.LpProblem("MaxCoverageNoExceed", pulp.LpMaximize)
+
+coverage_vars = [
+    pulp.LpVariable(f"coverage_{t}", lowBound=0, cat=pulp.LpInteger)
+    for t in range(48)
+]
+
+# Objective: maximize total coverage across all half-hours
+prob += pulp.lpSum(coverage_vars[t]*k[t] for t in range(48)), "TotalCoverage"
+
+# Constraint: coverage[t]*k(t) <= required[t] (no slot can exceed required coverage)
+for t in range(48):
+    if k[t] == 0:
+        # If no shift covers t:
+        # - if required[t] > 0 => can't cover => model might be infeasible
+        # - if required[t] = 0 => coverage[t] must be 0
+        if required[t] > 0:
+            # Force the solver to see infeasibility or large violation
+            prob += coverage_vars[t] == 9999999, f"Infeasible_{t}"
+        else:
+            prob += coverage_vars[t] == 0, f"ZeroCoverage_{t}"
+    else:
+        prob += coverage_vars[t]*k[t] <= required[t], f"NoExceed_{t}"
+
+# ----- 4) Solve -----
+prob.solve(pulp.PULP_CBC_CMD(msg=0))
+
+print("Solver status:", pulp.LpStatus[prob.status])
+if prob.status == pulp.LpStatusOptimal:
+    print("Objective (Total Coverage) =", pulp.value(prob.objective))
+    # Build a result table
+    rows = []
+    for t in range(48):
+        c_val = int(pulp.value(coverage_vars[t]) or 0)
+        # coverage each shift = c_val if shift covers t, else 0
+        shift_vals = []
+        for s_id in [1,2,3,4,5]:
+            shift_vals.append(c_val if s_id in cover_matrix[t] else 0)
+        row = {
+            "Time": time_labels[t],
+            "Shift1": shift_vals[0],
+            "Shift2": shift_vals[1],
+            "Shift3": shift_vals[2],
+            "Shift4": shift_vals[3],
+            "Shift5": shift_vals[4],
+            "Total HC": c_val*k[t],
+            "Required": required[t]
+        }
+        rows.append(row)
+
+    df_solution = pd.DataFrame(rows)
+    print(df_solution.to_string(index=False))
+else:
+    print("No feasible solution found or other solver issue.")
