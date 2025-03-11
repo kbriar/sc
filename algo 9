@@ -1,0 +1,156 @@
+#!pip install pulp
+import pulp
+import pandas as pd
+
+# ------------------------------------------------------------------------------
+# 1) Time slots and required coverage in half-hour increments
+# ------------------------------------------------------------------------------
+time_labels = []
+for t in range(48):
+    hh = t // 2
+    mm = (t % 2)*30
+    time_labels.append(f"{hh:02d}:{mm:02d}")
+
+required = [
+    24,19,16,16,18,15,12, 8,10,11, 7, 4,   # 00:00..05:30
+    18,14, 7, 8, 9, 9,13,11, 9,11,13,14,   # 06:00..11:30
+    16,15,16,16,23,23,20,14,17,17,18,20,   # 12:00..17:30
+    24,23,22,21,16,19,16,16,21,21,21,19    # 18:00..23:30
+]
+assert len(required) == 48
+
+# ------------------------------------------------------------------------------
+# 2) Define 5 shifts, each with one integer variable x_s => same staff all shift
+#    SHIFT 1 = 06:00..15:00
+#    SHIFT 2 = 10:00..19:00
+#    SHIFT 3 = 14:00..23:00
+#    SHIFT 4 = 20:00..05:00 (wrap)
+#    SHIFT 5 = 23:00..08:00 (wrap)
+# ------------------------------------------------------------------------------
+shifts = {
+    1: (6, 15),
+    2: (10,19),
+    3: (14,23),
+    4: (20, 5),
+    5: (23, 8),
+}
+
+def in_interval_mod24(x, start, end):
+    """True if x mod 24 is in [start, end) mod 24 (handling midnight wrap)."""
+    x_mod = x % 24
+    s_mod = start % 24
+    e_mod = end % 24
+    if s_mod < e_mod:
+        return s_mod <= x_mod < e_mod
+    else:
+        # wrap
+        return (x_mod >= s_mod) or (x_mod < e_mod)
+
+def shift_covers_slot(sstart, send, slot_index):
+    """Check if shift covers midpoint of half-hour slot_index (0..47)."""
+    midpoint = slot_index*0.5 + 0.25
+    return in_interval_mod24(midpoint, sstart, send)
+
+# For each slot t, which shifts cover it?
+cover_list = []
+for t in range(48):
+    covering = []
+    for sid, (st, en) in shifts.items():
+        if shift_covers_slot(st, en, t):
+            covering.append(sid)
+    cover_list.append(covering)
+
+# ------------------------------------------------------------------------------
+# PHASE 1: Minimize total staff
+# ------------------------------------------------------------------------------
+phase1 = pulp.LpProblem("Phase1_MinTotalStaff", pulp.LpMinimize)
+x1 = {s: pulp.LpVariable(f"x1_shift{s}", lowBound=0, cat=pulp.LpInteger) 
+      for s in shifts}
+
+# Objective: minimize sum of x1[s]
+phase1 += pulp.lpSum(x1[s] for s in shifts), "TotalStaff_Phase1"
+
+# Coverage constraints: sum of x1[s] for shifts covering slot t >= required[t]
+for t in range(48):
+    phase1 += pulp.lpSum(x1[s] for s in cover_list[t]) >= required[t], f"CovP1_{t}"
+
+phase1.solve(pulp.PULP_CBC_CMD(msg=0))
+print("PHASE 1 solve status:", pulp.LpStatus[phase1.status])
+
+if pulp.LpStatus[phase1.status] != "Optimal":
+    print("No feasible solution in Phase 1.")
+else:
+    # Minimal total staff
+    min_total_staff = pulp.value(phase1.objective)
+    print(f"Minimal total staff = {min_total_staff}")
+
+    # Extract one solution
+    solution_p1 = {s: int(pulp.value(x1[s]) or 0) for s in shifts}
+    print("Phase 1 staff distribution (example solution):", solution_p1)
+
+    # ----------------------------------------------------------------------------
+    # PHASE 2: Among all solutions with sum x[s] = min_total_staff,
+    # minimize (x_max - x_min) to make shifts as even as possible.
+    # ----------------------------------------------------------------------------
+    phase2 = pulp.LpProblem("Phase2_MinSpread", pulp.LpMinimize)
+    x2 = {s: pulp.LpVariable(f"x2_shift{s}", lowBound=0, cat=pulp.LpInteger) 
+          for s in shifts}
+
+    # We'll define x_min, x_max as continuous or integer. For strictness, let's do integer:
+    x_min = pulp.LpVariable("x_min", lowBound=0, cat=pulp.LpInteger)
+    x_max = pulp.LpVariable("x_max", lowBound=0, cat=pulp.LpInteger)
+
+    # Objective: minimize x_max - x_min
+    phase2 += (x_max - x_min), "MinRange"
+
+    # 1) Coverage constraints: sum of x2[s] >= required[t]
+    for t in range(48):
+        phase2 += pulp.lpSum(x2[s] for s in cover_list[t]) >= required[t], f"CovP2_{t}"
+
+    # 2) The total staff must equal min_total_staff
+    phase2 += pulp.lpSum(x2[s] for s in shifts) == min_total_staff, "FixedTotalStaff"
+
+    # 3) x_min <= x2[s] <= x_max for each shift
+    for s in shifts:
+        phase2 += x2[s] >= x_min, f"BoundLower_{s}"
+        phase2 += x2[s] <= x_max, f"BoundUpper_{s}"
+
+    phase2.solve(pulp.PULP_CBC_CMD(msg=0))
+    print("PHASE 2 solve status:", pulp.LpStatus[phase2.status])
+
+    if pulp.LpStatus[phase2.status] == "Optimal":
+        spread = pulp.value(x_max) - pulp.value(x_min)
+        print(f"Minimal spread (x_max - x_min) = {spread}")
+
+        solution_p2 = {s: int(pulp.value(x2[s]) or 0) for s in shifts}
+        print("Phase 2 distribution:", solution_p2)
+
+        # ------------------------------------------------------------------------
+        # Build final coverage table from Phase 2 solution
+        # ------------------------------------------------------------------------
+        rows = []
+        for t in range(48):
+            coverage = [solution_p2[s] if s in cover_list[t] else 0 for s in shifts]
+            rows.append({
+                "Time": time_labels[t],
+                "Shift1": coverage[0],
+                "Shift2": coverage[1],
+                "Shift3": coverage[2],
+                "Shift4": coverage[3],
+                "Shift5": coverage[4],
+                "Total Coverage": sum(coverage),
+                "Required": required[t],
+            })
+        df = pd.DataFrame(rows)
+
+        print("\nTime-Slot Coverage Table (Phase 2):")
+        print(df.to_string(index=False))
+
+        print("\nCheck final stats:")
+        print("  Sum of staff  =", sum(solution_p2.values()))
+        print(f"  x_min         = {pulp.value(x_min)}")
+        print(f"  x_max         = {pulp.value(x_max)}")
+        print(f"  x_max - x_min = {spread}")
+
+    else:
+        print("Phase 2 found no solution that keeps the total staff fixed AND improves balance.")
