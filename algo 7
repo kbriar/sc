@@ -1,0 +1,127 @@
+#!pip install pulp
+import pulp
+import pandas as pd
+
+# ------------------------------------------------------------------------------
+# 1) Define half-hour slots (t=0..47 => 00:00..23:30) and required coverage per slot
+#    Adjust these to match your real coverage needs.
+# ------------------------------------------------------------------------------
+time_labels = []
+for t in range(48):
+    hh = t // 2
+    mm = (t % 2)*30
+    time_labels.append(f"{hh:02d}:{mm:02d}")
+
+required = [
+    24,19,16,16,18,15,12, 8,10,11, 7, 4,   # 00:00..05:30
+    18,14, 7, 8, 9, 9,13,11, 9,11,13,14,   # 06:00..11:30
+    16,15,16,16,23,23,20,14,17,17,18,20,   # 12:00..17:30
+    24,23,22,21,16,19,16,16,21,21,21,19    # 18:00..23:30
+]
+assert len(required) == 48
+
+# ------------------------------------------------------------------------------
+# 2) Define your 5 shifts with (start_hour, end_hour) in [0..24),
+#    possibly wrapping past midnight if end < start.
+# ------------------------------------------------------------------------------
+shifts = {
+    1: (6, 15),   # Shift 1 = 06:00..15:00
+    2: (10,19),   # Shift 2 = 10:00..19:00
+    3: (14,23),   # Shift 3 = 14:00..23:00
+    4: (20, 5),   # Shift 4 = 20:00..05:00 next day
+    5: (23, 8),   # Shift 5 = 23:00..08:00 next day
+}
+
+def in_interval_mod24(x, start, end):
+    """
+    Returns True if x mod 24 is in [start, end) mod 24,
+    handling the case where end < start (i.e., wraps midnight).
+    """
+    x_mod = x % 24
+    s_mod = start % 24
+    e_mod = end % 24
+    if s_mod < e_mod:
+        return s_mod <= x_mod < e_mod
+    else:
+        # The interval wraps midnight
+        return (x_mod >= s_mod) or (x_mod < e_mod)
+
+def shift_covers_slot(shift_start, shift_end, slot_index):
+    """
+    True if the shift covers the midpoint of half-hour slot_index.
+    slot_index in [0..47].
+    """
+    midpoint = slot_index*0.5 + 0.25  # hours
+    return in_interval_mod24(midpoint, shift_start, shift_end)
+
+# Precompute which shifts cover each half-hour t
+cover_list = []
+for t in range(48):
+    covering_shifts = []
+    for s_id, (s_start, s_end) in shifts.items():
+        if shift_covers_slot(s_start, s_end, t):
+            covering_shifts.append(s_id)
+    cover_list.append(covering_shifts)
+
+# ------------------------------------------------------------------------------
+# 3) Integer LP: One variable x[s] per shift => constant staff for that shift
+#    Coverage >= required[t], minimized total staff.
+# ------------------------------------------------------------------------------
+model = pulp.LpProblem("MinimizeTotalShiftStaff", pulp.LpMinimize)
+
+# Decision variables: how many staff on each shift (integer).
+x = {s_id: pulp.LpVariable(f"x_shift{s_id}", lowBound=0, cat=pulp.LpInteger)
+     for s_id in shifts}
+
+# Objective: minimize sum of staff across all shifts
+model += pulp.lpSum(x[s_id] for s_id in shifts), "TotalStaff"
+
+# Coverage constraints: sum of x[s_id] for shifts covering t >= required[t]
+for t in range(48):
+    model += pulp.lpSum(x[s_id] for s_id in cover_list[t]) >= required[t], f"Coverage_t{t}"
+
+# Solve
+model.solve(pulp.PULP_CBC_CMD(msg=0))
+print("Solver status:", pulp.LpStatus[model.status])
+
+if pulp.LpStatus[model.status] == "Optimal":
+    # SHIFT-LEVEL SUMMARY: how many staff on each shift
+    shift_staff = {s: int(pulp.value(x[s]) or 0) for s in shifts}
+    print("\nSHIFT-LEVEL SUMMARY:")
+    for s_id in sorted(shift_staff.keys()):
+        start, end = shifts[s_id]
+        print(f" Shift {s_id}: {shift_staff[s_id]} staff, covering {start:02d}:00..{end:02d}:00")
+
+    total_staff = sum(shift_staff.values())
+    print(f"\nTotal Staff Across All Shifts = {total_staff}")
+
+    # --------------------------------------------------------------------------
+    # 4) DETAILED TIME-SLOT TABLE in the same style as your image:
+    #    Time, Shift1, Shift2, Shift3, Shift4, Shift5, Total Coverage, Required
+    # --------------------------------------------------------------------------
+    rows = []
+    for t in range(48):
+        # For each half-hour, coverage from shift i is x[i] if shift i covers t, else 0
+        shift_cov = []
+        for s_id in sorted(shifts.keys()):
+            shift_cov.append( shift_staff[s_id] if s_id in cover_list[t] else 0 )
+        total_cov = sum(shift_cov)
+
+        row = {
+            "Time": time_labels[t],
+            "Shift1": shift_cov[0],
+            "Shift2": shift_cov[1],
+            "Shift3": shift_cov[2],
+            "Shift4": shift_cov[3],
+            "Shift5": shift_cov[4],
+            "Total Coverage": total_cov,
+            "Required": required[t]
+        }
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    print("\nTIME-SLOT COVERAGE TABLE:")
+    print(df.to_string(index=False))
+
+else:
+    print("No feasible solution found or problem unbounded.")
