@@ -1,0 +1,152 @@
+#!pip install pulp   # Uncomment if PuLP is not installed.
+
+import pulp
+import math
+import pandas as pd
+
+# ---------------------------------------------------------------------------------
+# 1) Set up the time slots and required headcounts (one value per half-hour).
+#    We'll label t=0 as 00:00-00:30, t=1 as 00:30-01:00, ..., t=47 as 23:30-00:00
+# ---------------------------------------------------------------------------------
+time_labels = []
+for t in range(48):
+    hour = t // 2
+    minute = (t % 2)*30
+    time_labels.append(f"{hour:02d}:{minute:02d}")
+
+required = [
+    24,19,16,16,18,15,12, 8,10,11, 7, 4,   # 00:00..05:30
+    18,14, 7, 8, 9, 9,13,11, 9,11,13,14,   # 06:00..11:30
+    16,15,16,16,23,23,20,14,17,17,18,20,   # 12:00..17:30
+    24,23,22,21,16,19,16,16,21,21,21,19    # 18:00..23:30
+]
+
+# Sanity check: we should have 48 half-hour required values
+assert len(required) == 48
+
+
+# ---------------------------------------------------------------------------------
+# 2) Define the 5 shifts, each with a start/end time (in hours on [0..24)),
+#    but note that Shifts 4 and 5 cross midnight.
+#
+#    We'll treat them as intervals mod 24. We'll say a shift covers slot t
+#    if the midpoint of that half-hour is in the shift's interval (mod 24).
+# ---------------------------------------------------------------------------------
+# Shift definitions:
+shifts = {
+    1: (6, 15),   # Shift 1 = 06:00..15:00
+    2: (10, 19),  # Shift 2 = 10:00..19:00
+    3: (14, 23),  # Shift 3 = 14:00..23:00
+    4: (20, 5),   # Shift 4 = 20:00..05:00 next day
+    5: (23, 8),   # Shift 5 = 23:00..08:00 next day
+}
+
+def in_interval_mod24(mid, start, end):
+    """
+    Returns True if 'mid' (in [0..24)) lies in [start, end) mod 24.
+    """
+    # normalize everything to [0, 24)
+    mid   = mid % 24
+    start = start % 24
+    end   = end % 24
+
+    if start < end:
+        return (start <= mid < end)
+    else:
+        # The interval wraps midnight, so it's [start..24) plus [0..end)
+        return (mid >= start) or (mid < end)
+
+def shift_covers_slot(shift_id, slot_index):
+    """
+    Checks if shift 'shift_id' covers the half-hour slot 'slot_index',
+    by testing whether the slot's midpoint is in the shift interval mod 24.
+    """
+    start, end = shifts[shift_id]
+    # midpoint of slot t is t*0.5 + 0.25 hours, but simpler is (2t+1)/2
+    # but we can just do: midpoint = (slot_index + 0.5)*0.5 -> that is slot_index*0.5 + 0.25
+    midpoint = slot_index*0.5 + 0.25  # hours
+    return in_interval_mod24(midpoint, start, end)
+
+
+# Precompute which shifts cover each timeslot
+cover_matrix = {}  # cover_matrix[t] = list of shifts that cover slot t
+for t in range(48):
+    cover_matrix[t] = []
+    for s in shifts:
+        if shift_covers_slot(s, t):
+            cover_matrix[t].append(s)
+
+# k(t) = how many shifts cover timeslot t
+k = [len(cover_matrix[t]) for t in range(48)]
+
+
+# ---------------------------------------------------------------------------------
+# 3) Formulate the LP:
+#    - coverage[t] = coverage level in half-hour t (same for all shifts that overlap)
+#    - sum of coverage in t is coverage[t] * k(t).  Must be <= required[t].
+#    - objective: minimize the total sum of coverage = sum_{t} [ coverage[t]*k(t) ].
+# ---------------------------------------------------------------------------------
+prob = pulp.LpProblem("ShiftScheduling", pulp.LpMinimize)
+
+# Create variables: coverage[t] >= 0 for each half-hour t
+coverage = [
+    pulp.LpVariable(f"c_{t}", lowBound=0, cat=pulp.LpContinuous)
+    for t in range(48)
+]
+
+# Objective: minimize sum_{t} coverage[t] * k(t)
+prob += pulp.lpSum([coverage[t]*k[t] for t in range(48)]), "TotalHeadcount"
+
+# Constraint: coverage[t] * k(t) <= required[t], for each t
+for t in range(48):
+    if k[t] > 0:
+        prob += coverage[t]*k[t] <= required[t], f"MaxCoverage_t{t}"
+    else:
+        # If k[t] = 0 but required[t] > 0, it's unsatisfiable because
+        # no shift covers that slot. If required[t] = 0, coverage[t] can be 0.
+        # We'll just enforce coverage[t] = 0 in the k[t]=0 case:
+        prob += coverage[t] == 0, f"NoShifts_t{t}"
+
+# ---------------------------------------------------------------------------------
+# 4) Solve the LP
+# ---------------------------------------------------------------------------------
+prob.solve(pulp.PULP_CBC_CMD(msg=0))
+
+print("Solver status:", pulp.LpStatus[prob.status])
+
+if prob.status != pulp.LpStatusOptimal:
+    print("No optimal solution found (perhaps infeasible).")
+else:
+    print("Objective (Total Headcount):", pulp.value(prob.objective))
+
+    # -------------------------------------------------------------------------
+    # 5) Build a results table with:
+    #    Time slot, shift1..shift5 coverage, total coverage, and required
+    # -------------------------------------------------------------------------
+    rows = []
+    for t in range(48):
+        val_t = pulp.value(coverage[t])
+        # coverage for each shift i is val_t if that shift covers t, else 0
+        shift_vals = []
+        for s in [1,2,3,4,5]:
+            if s in cover_matrix[t]:
+                shift_vals.append(val_t)
+            else:
+                shift_vals.append(0.0)
+        total_covered = sum(shift_vals)
+
+        rows.append({
+            "Time": time_labels[t],
+            "Shift1": shift_vals[0],
+            "Shift2": shift_vals[1],
+            "Shift3": shift_vals[2],
+            "Shift4": shift_vals[3],
+            "Shift5": shift_vals[4],
+            "Total HC": total_covered,
+            "Required": required[t]
+        })
+
+    df_solution = pd.DataFrame(rows)
+    pd.set_option('display.float_format', '{:0.2f}'.format)  # nicer float display
+    print(df_solution.to_string(index=False))
+
